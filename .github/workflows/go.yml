@@ -37,3 +37,26 @@ jobs:
         set GOARCH=arm
         set GOOS=linux
         go build --ldflags="-w -s" -o "../../xyz.cloud/cloud-api-amd64-linux-v1"
+
+    - name: Deploy to Server
+      # 服务地址: https://github.com/AEnterprise/rsync-deploy
+      uses: AEnterprise/rsync-deploy@v1.0
+      env:
+        DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        ARGS: -avz
+        SERVER_PORT: ${{ secrets.SSH_PORT }}
+        FOLDER: ./xyz.saynice
+        SERVER_IP: ${{ secrets.SSH_HOST }}
+        USERNAME: ${{ secrets.SSH_USERNAME }}
+        SERVER_DESTINATION: /home/app
+
+    - name: Restart Server
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.SSH_HOST }}
+        username: ${{ secrets.SSH_USERNAME }}
+        port: ${{ secrets.SSH_PORT }}
+        key: ${{ secrets.DEPLOY_KEY }}
+        script: |
+          cd /home/app/xyz.cloud
+          sh setup.sh
