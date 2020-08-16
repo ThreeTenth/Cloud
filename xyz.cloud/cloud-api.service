@@ -1,5 +1,5 @@
 [Unit]
-Description=SayNice API Service
+Description=Cloud API Service
 Require=network.target
 After=syslog.target network.target remote-fs.target nss-lookup.target
 
