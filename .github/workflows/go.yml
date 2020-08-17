@@ -36,7 +36,7 @@ jobs:
       run:  | 
         set GOARCH=arm
         set GOOS=linux
-        go build --ldflags="-w -s" -o "../../xyz.cloud/cloud-api-amd64-linux-v1"
+        go build -trimpath --ldflags="-w -s" -o "../../xyz.cloud/cloud-api-amd64-linux-v1"
 
     - name: Deploy to Server
       # 服务地址: https://github.com/AEnterprise/rsync-deploy
