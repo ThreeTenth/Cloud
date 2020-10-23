@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -13,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
@@ -21,6 +25,33 @@ import (
 
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
 )
+
+const indexHTMLTemplate = `<!DOCTYPE HTML>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Drop files here or click to upload</title>
+	<link rel="stylesheet" href="https://cdn.jsdelivr.net/combine/npm/dropzone@5.7.2/dist/basic.min.css,npm/dropzone@5.7.2/dist/dropzone.min.css">
+	<script src="https://cdn.jsdelivr.net/npm/dropzone@5.7.2/dist/dropzone.min.js"></script>
+</head>
+<body>
+<form action="/v1/file" class="dropzone" style="border: 2px dashed #0087F7;">
+		<div class="dz-message needsclick">
+    <h3>Drop files here or click to upload.</h3>
+    <dd>This is just a demo. Selected files are <strong>not</strong> actually uploaded.</dd>
+	  </div>
+</form>
+  <script>
+    document.onclick = function (e) {
+      var e = e ? e : window.event;
+      var tar = e.srcElement || e.target;
+			var cls = tar.parentElement ? tar.parentElement.className : tar.className;
+			if ("dz-filename" == cls) { window.open("/v1/file/"+tar.innerText); }
+    } 
+  </script>
+</body>
+</html>
+`
 
 const (
 	defaultMaxMemory = 512 << 20 // 512 MB
@@ -63,39 +94,20 @@ type APK struct {
 	FileURL     string `gorm:"type:text;default:'';not null;"`
 }
 
-func initFlag() {
-	flag.StringVar(&downloadPath, "D", "./cloud", "文件存储路径")
-	flag.Parse()
-	flag.Usage()
+// Storage 存储对象
+type Storage struct {
 }
 
-func initDB() {
-	var err error
-	sqlite, err = gorm.Open("sqlite3", filepath.Join(downloadPath, "cloud.db"))
+// IndexHTML Cloud 试用首页
+func IndexHTML(c *gin.Context) {
+	tmpl, err := template.New("index").Parse(indexHTMLTemplate)
 	if err != nil {
-		panic("failed to connect database: " + err.Error())
+		c.String(http.StatusInternalServerError, err.Error())
+		return
 	}
 
-	err = sqlite.AutoMigrate(&APK{}).Error
-
-	if nil != err {
-		panic(err)
-	}
-}
-
-func main() {
-	initFlag()
-	initDB()
-
-	defer sqlite.Close()
-
-	router := gin.Default()
-	v1 := router.Group("/v1")
-
-	v1.GET("/apk/:package/:version", output(GetLatestAPK))
-	v1.POST("/apk", output(PostAPK))
-
-	router.Run(":19823")
+	c.Status(200)
+	tmpl.Execute(c.Writer, "flysnow_org")
 }
 
 func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
@@ -116,6 +128,113 @@ func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
 			c.File(msg.Data.(string))
 		}
 	}
+}
+
+// GetFile 获取指定文件
+func GetFile(c *gin.Context) APIMessage {
+	filename := c.Param("name")
+
+	fileuri := filepath.Join(downloadPath, filename)
+
+	fi, e := os.Stat(fileuri)
+
+	if e != nil {
+		return getStringAPIMessage(http.StatusGone, e.Error())
+	}
+
+	c.Writer.WriteHeader(http.StatusOK)
+	c.Header("Content-Description", "File Transfer")
+	c.Header("Content-Transfer-Encoding", "binary")
+	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Accept-Length", fmt.Sprintf("%d", fi.Size()))
+
+	return getBinaryAPIMessage(http.StatusOK, fileuri)
+}
+
+// PostFile 保存文件
+func PostFile(c *gin.Context) APIMessage {
+	if c.Request.MultipartForm == nil {
+		e := c.Request.ParseMultipartForm(defaultMaxMemory)
+		if e != nil {
+			return getStringAPIMessage(http.StatusRequestEntityTooLarge, e.Error())
+		}
+	}
+
+	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
+		status := make(map[string]string)
+		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
+			for _, v := range files {
+				file, eo := v.Open()
+
+				if eo != nil {
+					status[v.Filename] = eo.Error()
+					continue
+				}
+				defer file.Close()
+
+				fileuri := filepath.Join(downloadPath, v.Filename)
+
+				f, eof := os.OpenFile(fileuri, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+				if eof != nil {
+					status[v.Filename] = eof.Error()
+					continue
+				}
+				defer f.Close()
+
+				h := md5.New()
+				buf := make([]byte, 1024)
+				var err error
+
+				for {
+					nr, er := file.Read(buf)
+
+					if nr > 0 {
+						// 计算文件 md5 值
+						nw, ew := h.Write(buf[:nr])
+						if ew != nil {
+							err = ew
+							break
+						}
+						if nr != nw {
+							err = io.ErrShortWrite
+							break
+						}
+
+						// 储存文件
+						nw, ew = f.Write(buf[:nr])
+						if ew != nil {
+							err = ew
+							break
+						}
+						if nr != nw {
+							err = io.ErrShortWrite
+							break
+						}
+					}
+					if er != nil {
+						if er != io.EOF {
+							err = er
+						}
+						break
+					}
+				}
+
+				if err != nil {
+					status[v.Filename] = err.Error()
+				}
+
+				fmt.Println(hex.EncodeToString(h.Sum(nil)))
+			}
+
+			if 0 < len(status) {
+				return getJSONAPIMessage(http.StatusInternalServerError, status)
+			}
+			return getJSONAPIMessage(http.StatusOK, nil)
+		}
+	}
+
+	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
 }
 
 // GetLatestAPK 根据包名和版本号，获取最新的 APK 文件
@@ -371,4 +490,89 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	// If the reader has a WriteTo method, use it to do the copy.
+	// Avoids an allocation and a copy.
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	// Similarly, if the writer has a ReadFrom method, use it to do the copy.
+	if rt, ok := dst.(io.ReaderFrom); ok {
+		return rt.ReadFrom(src)
+	}
+	if buf == nil {
+		size := 32 * 1024
+		if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
+			if l.N < 1 {
+				size = 1
+			} else {
+				size = int(l.N)
+			}
+		}
+		buf = make([]byte, size)
+	}
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return written, err
+}
+
+func initFlag() {
+	flag.StringVar(&downloadPath, "D", "./cloud", "文件存储路径")
+	flag.Parse()
+	flag.Usage()
+}
+
+func initDB() {
+	var err error
+	sqlite, err = gorm.Open("sqlite3", filepath.Join(downloadPath, "cloud.db"))
+	if err != nil {
+		panic("failed to connect database: " + err.Error())
+	}
+
+	err = sqlite.AutoMigrate(&APK{}).Error
+
+	if nil != err {
+		panic(err)
+	}
+}
+
+func main() {
+	initFlag()
+	initDB()
+
+	defer sqlite.Close()
+
+	router := gin.Default()
+	v1 := router.Group("/v1")
+
+	v1.GET("/", IndexHTML)
+	v1.GET("/file/:name", output(GetFile))
+	v1.POST("/file", output(PostFile))
+	v1.GET("/apk/:package/:version", output(GetLatestAPK))
+	v1.POST("/apk", output(PostAPK))
+
+	router.Run(":19823")
 }
