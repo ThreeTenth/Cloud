@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
@@ -96,6 +98,10 @@ type APK struct {
 
 // Storage 存储对象
 type Storage struct {
+	gorm.Model
+	Md5  string `gorm:"type:text;not null;"`
+	Path string `gorm:"type:text;not null;"`
+	Name string `gorm:"type:text;not null;"`
 }
 
 // IndexHTML Cloud 试用首页
@@ -130,16 +136,28 @@ func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
 	}
 }
 
+func checkMultipartForm(c *gin.Context) error {
+	if c.Request.MultipartForm == nil {
+		e := c.Request.ParseMultipartForm(defaultMaxMemory)
+		return e
+	}
+	return nil
+}
+
 // GetFile 获取指定文件
 func GetFile(c *gin.Context) APIMessage {
 	filename := c.Param("name")
 
-	fileuri := filepath.Join(downloadPath, filename)
+	var storage Storage
+	ef := sqlite.Where("name=?", filename).Find(&storage).Error
+	if ef != nil {
+		return getStringAPIMessage(http.StatusGone, ef.Error())
+	}
 
-	fi, e := os.Stat(fileuri)
+	fi, e := os.Stat(storage.Path)
 
 	if e != nil {
-		return getStringAPIMessage(http.StatusGone, e.Error())
+		return getStringAPIMessage(http.StatusGone, "The system cannot find the file specified.")
 	}
 
 	c.Writer.WriteHeader(http.StatusOK)
@@ -149,92 +167,169 @@ func GetFile(c *gin.Context) APIMessage {
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Accept-Length", fmt.Sprintf("%d", fi.Size()))
 
-	return getBinaryAPIMessage(http.StatusOK, fileuri)
+	return getBinaryAPIMessage(http.StatusOK, storage.Path)
 }
 
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	if c.Request.MultipartForm == nil {
-		e := c.Request.ParseMultipartForm(defaultMaxMemory)
-		if e != nil {
-			return getStringAPIMessage(http.StatusRequestEntityTooLarge, e.Error())
+	if e := checkMultipartForm(c); e != nil {
+		return getStringAPIMessage(http.StatusBadRequest, e.Error())
+	}
+
+	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
+		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
+			filename := c.Param("name")
+			if filename == "/" {
+				filename = files[0].Filename
+			}
+			_, err := saveFile(filename, files[0])
+			if err != nil {
+				return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+			}
+			return getStringAPIMessage(http.StatusOK, "Success")
 		}
+	}
+
+	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
+}
+
+// PostFiles 保存多个文件
+func PostFiles(c *gin.Context) APIMessage {
+	if e := checkMultipartForm(c); e != nil {
+		return getStringAPIMessage(http.StatusBadRequest, e.Error())
 	}
 
 	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
 		status := make(map[string]string)
 		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
 			for _, v := range files {
-				file, eo := v.Open()
-
-				if eo != nil {
-					status[v.Filename] = eo.Error()
-					continue
-				}
-				defer file.Close()
-
-				fileuri := filepath.Join(downloadPath, v.Filename)
-
-				f, eof := os.OpenFile(fileuri, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-				if eof != nil {
-					status[v.Filename] = eof.Error()
-					continue
-				}
-				defer f.Close()
-
-				h := md5.New()
-				buf := make([]byte, 1024)
-				var err error
-
-				for {
-					nr, er := file.Read(buf)
-
-					if nr > 0 {
-						// 计算文件 md5 值
-						nw, ew := h.Write(buf[:nr])
-						if ew != nil {
-							err = ew
-							break
-						}
-						if nr != nw {
-							err = io.ErrShortWrite
-							break
-						}
-
-						// 储存文件
-						nw, ew = f.Write(buf[:nr])
-						if ew != nil {
-							err = ew
-							break
-						}
-						if nr != nw {
-							err = io.ErrShortWrite
-							break
-						}
-					}
-					if er != nil {
-						if er != io.EOF {
-							err = er
-						}
-						break
-					}
-				}
-
+				filename, err := saveFile(v.Filename, v)
 				if err != nil {
-					status[v.Filename] = err.Error()
+					status[filename] = err.Error()
 				}
-
-				fmt.Println(hex.EncodeToString(h.Sum(nil)))
 			}
 
 			if 0 < len(status) {
+				for k := range status {
+					os.Remove(filepath.Join(temp(), k))
+				}
 				return getJSONAPIMessage(http.StatusInternalServerError, status)
 			}
-			return getJSONAPIMessage(http.StatusOK, nil)
+			return getStringAPIMessage(http.StatusOK, "Success")
 		}
 	}
 
 	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
+}
+
+func saveFile(filename string, v *multipart.FileHeader) (string, error) {
+	file, eo := v.Open()
+
+	if eo != nil {
+		return filename, eo
+	}
+	defer file.Close()
+
+	tempuri := filepath.Join(temp(), filename)
+
+	_, es := os.Stat(tempuri)
+	if es == nil {
+		return filename, errors.New("File already exists")
+	}
+
+	temp, eof := os.OpenFile(tempuri, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if eof != nil {
+		return filename, eof
+	}
+
+	h := md5.New()
+	buf := make([]byte, 1024)
+	var err error
+
+	for {
+		nr, er := file.Read(buf)
+
+		if nr > 0 {
+			// 计算文件 md5 值
+			nw, ew := h.Write(buf[:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+
+			// 储存临时文件
+			nw, ew = temp.Write(buf[:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+
+	if err1 := temp.Close(); err == nil {
+		err = err1
+	}
+
+	if err != nil {
+		return filename, err
+	}
+
+	md5str := hex.EncodeToString(h.Sum(nil))
+	filedir := filepath.Join(downloadPath, time.Now().Format("20060102"))
+	em := MkdirIfNotExists(filedir)
+	if em != nil {
+		return filename, em
+	}
+	// 如果存在同名且文件md5相同的情况，则直接返回成功
+	// 如果存在同名但文件md5不相同的情况，则返回重命名错误
+	// 如果存在不同名而文件md5相同的情况，则直接写入一条数据即可
+	hasExist := false
+	filepath := filepath.Join(filedir, md5str)
+	_, es = os.Stat(filepath)
+	if es != nil && os.IsNotExist(es) {
+		er := os.Rename(tempuri, filepath)
+		if er != nil {
+			return filename, er
+		}
+	} else {
+		hasExist = true
+	}
+
+	os.Remove(tempuri)
+
+	save := Storage{
+		Md5:  md5str,
+		Path: filepath,
+		Name: filename,
+	}
+
+	var count int
+	sqlite.Table("storages").Where("name=?", filename).Count(&count)
+	if 0 < count {
+		if !hasExist {
+			return filename, errors.New("There is already a file with the same name")
+		}
+		return filename, nil
+	}
+	ess := sqlite.Save(&save).Error
+	if ess != nil {
+		return filename, ess
+	}
+	return filename, nil
 }
 
 // GetLatestAPK 根据包名和版本号，获取最新的 APK 文件
@@ -492,57 +587,32 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 	return d, nil
 }
 
-func copyBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
-	// If the reader has a WriteTo method, use it to do the copy.
-	// Avoids an allocation and a copy.
-	if wt, ok := src.(io.WriterTo); ok {
-		return wt.WriteTo(dst)
+func temp() string {
+	return filepath.Join(downloadPath, "temp")
+}
+
+// MkdirIfNotExists 如果目录不存在则创建
+func MkdirIfNotExists(path string) error {
+	_, err := os.Stat(path)
+
+	if err != nil && os.IsNotExist(err) {
+		err = os.Mkdir(path, 0666)
 	}
-	// Similarly, if the writer has a ReadFrom method, use it to do the copy.
-	if rt, ok := dst.(io.ReaderFrom); ok {
-		return rt.ReadFrom(src)
-	}
-	if buf == nil {
-		size := 32 * 1024
-		if l, ok := src.(*io.LimitedReader); ok && int64(size) > l.N {
-			if l.N < 1 {
-				size = 1
-			} else {
-				size = int(l.N)
-			}
-		}
-		buf = make([]byte, size)
-	}
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			break
-		}
-	}
-	return written, err
+
+	return err
 }
 
 func initFlag() {
 	flag.StringVar(&downloadPath, "D", "./cloud", "文件存储路径")
 	flag.Parse()
 	flag.Usage()
+}
+
+func initStorage() {
+	err := MkdirIfNotExists(temp())
+	if err != nil {
+		panic("failed to create temp dir: " + err.Error())
+	}
 }
 
 func initDB() {
@@ -553,6 +623,7 @@ func initDB() {
 	}
 
 	err = sqlite.AutoMigrate(&APK{}).Error
+	err = sqlite.AutoMigrate(&Storage{}).Error
 
 	if nil != err {
 		panic(err)
@@ -561,6 +632,7 @@ func initDB() {
 
 func main() {
 	initFlag()
+	initStorage()
 	initDB()
 
 	defer sqlite.Close()
@@ -570,7 +642,8 @@ func main() {
 
 	v1.GET("/", IndexHTML)
 	v1.GET("/file/:name", output(GetFile))
-	v1.POST("/file", output(PostFile))
+	v1.POST("/file/*name", output(PostFile))
+	v1.POST("/files", output(PostFiles))
 	v1.GET("/apk/:package/:version", output(GetLatestAPK))
 	v1.POST("/apk", output(PostAPK))
 
