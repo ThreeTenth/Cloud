@@ -99,9 +99,11 @@ type APK struct {
 // Storage 存储对象
 type Storage struct {
 	gorm.Model
-	Md5  string `gorm:"type:text;not null;"`
-	Path string `gorm:"type:text;not null;"`
-	Name string `gorm:"type:text;not null;"`
+	Md5    string `gorm:"type:text;not null;"`
+	Path   string `gorm:"type:text;not null;"`
+	Name   string `gorm:"type:text;not null;"`
+	Length uint   `gorm:"type:integer;default:-1;not null;"`
+	Type   string `gorm:"type:text;default:'application/octet-stream';not null;"`
 }
 
 // IndexHTML Cloud 试用首页
@@ -151,21 +153,19 @@ func GetFile(c *gin.Context) APIMessage {
 	var storage Storage
 	ef := sqlite.Where("name=?", filename).Find(&storage).Error
 	if ef != nil {
-		return getStringAPIMessage(http.StatusGone, ef.Error())
+		return getStringAPIMessage(http.StatusNotFound, ef.Error())
 	}
 
-	fi, e := os.Stat(storage.Path)
+	_, e := os.Stat(storage.Path)
 
 	if e != nil {
-		return getStringAPIMessage(http.StatusGone, "The system cannot find the file specified.")
+		return getStringAPIMessage(http.StatusNotFound, "The system cannot find the file specified.")
 	}
 
-	c.Writer.WriteHeader(http.StatusOK)
-	c.Header("Content-Description", "File Transfer")
-	c.Header("Content-Transfer-Encoding", "binary")
-	c.Header("Content-Disposition", "attachment; filename="+filename)
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Accept-Length", fmt.Sprintf("%d", fi.Size()))
+	// 指定浏览器直接打开文件，不进行下载操作
+	c.Header("Content-Disposition", "inline; filename="+filename)
+	// 指定浏览器直接下载文件，不进行打开操作
+	// c.Header("Content-Disposition", "attachment; filename="+filename)
 
 	return getBinaryAPIMessage(http.StatusOK, storage.Path)
 }
@@ -242,10 +242,18 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 		return filename, eof
 	}
 
+	contentType, eg := GetFileContentType(file)
+
+	if eg != nil {
+		contentType = "application/octet-stream"
+	}
+
 	h := md5.New()
 	buf := make([]byte, 1024)
+	var len uint = 0
 	var err error
 
+	file.Seek(0, 0)
 	for {
 		nr, er := file.Read(buf)
 
@@ -271,6 +279,7 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 				err = io.ErrShortWrite
 				break
 			}
+			len += uint(nw)
 		}
 		if er != nil {
 			if er != io.EOF {
@@ -312,9 +321,11 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 	os.Remove(tempuri)
 
 	save := Storage{
-		Md5:  md5str,
-		Path: filepath,
-		Name: filename,
+		Md5:    md5str,
+		Path:   filepath,
+		Name:   filename,
+		Length: len,
+		Type:   contentType,
 	}
 
 	var count int
@@ -585,6 +596,25 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 		return nil, err
 	}
 	return d, nil
+}
+
+// GetFileContentType 获取文件格式
+// fs.go serveContent()#ctypes 变量获取方法
+// 又见：https://golangcode.com/get-the-content-type-of-file/
+func GetFileContentType(out multipart.File) (string, error) {
+	// Only the first 512 bytes are used to sniff the content type.
+	buffer := make([]byte, 512)
+
+	_, err := out.Read(buffer)
+	if err != nil {
+		return "", err
+	}
+
+	// Use the net/http package's handy DectectContentType function. Always returns a valid
+	// content-type by returning "application/octet-stream" if no others seemed to match.
+	contentType := http.DetectContentType(buffer)
+
+	return contentType, nil
 }
 
 func temp() string {
