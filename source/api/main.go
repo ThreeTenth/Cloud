@@ -179,7 +179,7 @@ func PostFile(c *gin.Context) APIMessage {
 	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
 		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
 			filename := c.Param("name")
-			if filename == "/" {
+			if filename == "" || filename == "/" {
 				filename = files[0].Filename
 			}
 			_, err := saveFile(filename, files[0])
@@ -588,7 +588,7 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 }
 
 func temp() string {
-	return filepath.Join(downloadPath, "temp")
+	return filepath.Join(downloadPath, ".temp")
 }
 
 // MkdirIfNotExists 如果目录不存在则创建
@@ -642,7 +642,8 @@ func main() {
 
 	v1.GET("/", IndexHTML)
 	v1.GET("/file/:name", output(GetFile))
-	v1.POST("/file/*name", output(PostFile))
+	v1.POST("/file", output(PostFile))
+	v1.POST("/file/:name", output(PostFile))
 	v1.POST("/files", output(PostFiles))
 	v1.GET("/apk/:package/:version", output(GetLatestAPK))
 	v1.POST("/apk", output(PostAPK))
