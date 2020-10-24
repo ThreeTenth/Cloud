@@ -39,7 +39,7 @@ jobs:
         SET GOARM=7
         SET CGO_ENABLED=1
         SET CC=arm-linux-gnueabihf-gcc
-        go build -trimpath --ldflags="-w -s" -o "../../xyz.cloud/cloud-api-amd64-linux-v1"
+        go build -trimpath --ldflags="-w -s" -o "../../xyz.cloud/cloud-api-linux-v1"
       # arm 平台移植: https://blog.51cto.com/13503908/2157169
       # arm-linux-gnueabihf-gcc 安装: https://zhuanlan.zhihu.com/p/25463241
 

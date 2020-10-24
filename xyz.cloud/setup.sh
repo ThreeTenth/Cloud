@@ -3,7 +3,7 @@ work_path=$(dirname $(readlink -f $0))
 
 systemctl stop cloud-api
 
-mv $work_path/cloud-api-amd64-linux-v1 /usr/local/bin/cloud-api
+mv $work_path/cloud-api-linux-v1 /usr/local/bin/cloud-api
 mv $work_path/cloud-api.service /lib/systemd/system
 
 rm -rf $work_path
