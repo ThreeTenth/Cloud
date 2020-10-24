@@ -102,7 +102,7 @@ type Storage struct {
 	Md5    string `gorm:"type:text;not null;"`
 	Path   string `gorm:"type:text;not null;"`
 	Name   string `gorm:"type:text;not null;"`
-	Length uint   `gorm:"type:integer;default:-1;not null;"`
+	Length int64  `gorm:"type:integer;default:0;not null;"`
 	Type   string `gorm:"type:text;default:'application/octet-stream';not null;"`
 }
 
@@ -115,7 +115,7 @@ func IndexHTML(c *gin.Context) {
 	}
 
 	c.Status(200)
-	tmpl.Execute(c.Writer, "flysnow_org")
+	tmpl.Execute(c.Writer, nil)
 }
 
 func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
@@ -166,6 +166,7 @@ func GetFile(c *gin.Context) APIMessage {
 	c.Header("Content-Disposition", "inline; filename="+filename)
 	// 指定浏览器直接下载文件，不进行打开操作
 	// c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Type", storage.Type)
 
 	return getBinaryAPIMessage(http.StatusOK, storage.Path)
 }
@@ -242,15 +243,11 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 		return filename, eof
 	}
 
-	contentType, eg := GetFileContentType(file)
-
-	if eg != nil {
-		contentType = "application/octet-stream"
-	}
+	contentType, _ := GetFileContentType(file)
 
 	h := md5.New()
 	buf := make([]byte, 1024)
-	var len uint = 0
+	var len int64 = 0
 	var err error
 
 	file.Seek(0, 0)
@@ -279,7 +276,7 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 				err = io.ErrShortWrite
 				break
 			}
-			len += uint(nw)
+			len += int64(nw)
 		}
 		if er != nil {
 			if er != io.EOF {
@@ -601,13 +598,13 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 // GetFileContentType 获取文件格式
 // fs.go serveContent()#ctypes 变量获取方法
 // 又见：https://golangcode.com/get-the-content-type-of-file/
-func GetFileContentType(out multipart.File) (string, error) {
+func GetFileContentType(out io.Reader) (string, error) {
 	// Only the first 512 bytes are used to sniff the content type.
 	buffer := make([]byte, 512)
 
 	_, err := out.Read(buffer)
 	if err != nil {
-		return "", err
+		return "application/octet-stream", err
 	}
 
 	// Use the net/http package's handy DectectContentType function. Always returns a valid
