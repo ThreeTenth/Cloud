@@ -9,10 +9,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"mime/multipart"
+	"mime"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -183,7 +184,8 @@ func PostFile(c *gin.Context) APIMessage {
 			if filename == "" || filename == "/" {
 				filename = files[0].Filename
 			}
-			_, err := saveFile(filename, files[0])
+			open := func() (io.ReadCloser, error) { return files[0].Open() }
+			_, err := saveFile(filename, open)
 			if err != nil {
 				return getStringAPIMessage(http.StatusInternalServerError, err.Error())
 			}
@@ -204,7 +206,8 @@ func PostFiles(c *gin.Context) APIMessage {
 		status := make(map[string]string)
 		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
 			for _, v := range files {
-				filename, err := saveFile(v.Filename, v)
+				open := func() (io.ReadCloser, error) { return v.Open() }
+				filename, err := saveFile(v.Filename, open)
 				if err != nil {
 					status[filename] = err.Error()
 				}
@@ -223,34 +226,70 @@ func PostFiles(c *gin.Context) APIMessage {
 	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
 }
 
-func saveFile(filename string, v *multipart.FileHeader) (string, error) {
-	file, eo := v.Open()
+// PostURI 提交一个 URI，进行离线下载
+func PostURI(c *gin.Context) APIMessage {
+	dl, ok := c.Params.Get("url")
+	if !ok && len(dl) <= 1 {
+		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
+	}
+
+	req, err := http.NewRequest("GET", dl[1:], nil)
+	if err != nil {
+		return getStringAPIMessage(http.StatusNotFound, "This uri can't find")
+	}
+
+	resp, ed := http.DefaultClient.Do(req)
+
+	if ed != nil {
+		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
+	}
+
+	defer resp.Body.Close()
+
+	disp := resp.Header.Get("Content-Disposition")
+	var filename string
+	_, params, ep := mime.ParseMediaType(disp)
+	if ep != nil {
+		filename = path.Base(req.URL.Path)
+	} else {
+		filename = params["filename"]
+	}
+
+	open := func() (io.ReadCloser, error) { return resp.Body, nil }
+	_, es := saveFile(filename, open)
+
+	if es != nil {
+		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
+	}
+
+	return getStringAPIMessage(http.StatusOK, "Success")
+}
+
+func saveFile(filename string, open func() (io.ReadCloser, error)) (string, error) {
+	file, eo := open()
 
 	if eo != nil {
 		return filename, eo
 	}
 	defer file.Close()
 
-	tempuri := filepath.Join(temp(), filename)
+	tempPath := filepath.Join(temp(), filename)
 
-	_, es := os.Stat(tempuri)
+	_, es := os.Stat(tempPath)
 	if es == nil {
 		return filename, errors.New("File already exists")
 	}
 
-	temp, eof := os.OpenFile(tempuri, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	temp, eof := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if eof != nil {
 		return filename, eof
 	}
-
-	contentType, _ := GetFileContentType(file)
 
 	h := md5.New()
 	buf := make([]byte, 1024)
 	var len int64 = 0
 	var err error
 
-	file.Seek(0, 0)
 	for {
 		nr, er := file.Read(buf)
 
@@ -300,14 +339,16 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 	if em != nil {
 		return filename, em
 	}
+
+	contentType, _ := GetFileContentType(tempPath)
 	// 如果存在同名且文件md5相同的情况，则直接返回成功
 	// 如果存在同名但文件md5不相同的情况，则返回重命名错误
 	// 如果存在不同名而文件md5相同的情况，则直接写入一条数据即可
 	hasExist := false
-	filepath := filepath.Join(filedir, md5str)
-	_, es = os.Stat(filepath)
+	filePath := filepath.Join(filedir, md5str)
+	_, es = os.Stat(filePath)
 	if es != nil && os.IsNotExist(es) {
-		er := os.Rename(tempuri, filepath)
+		er := os.Rename(tempPath, filePath)
 		if er != nil {
 			return filename, er
 		}
@@ -315,11 +356,11 @@ func saveFile(filename string, v *multipart.FileHeader) (string, error) {
 		hasExist = true
 	}
 
-	os.Remove(tempuri)
+	os.Remove(tempPath)
 
 	save := Storage{
 		Md5:    md5str,
-		Path:   filepath,
+		Path:   filePath,
 		Name:   filename,
 		Length: len,
 		Type:   contentType,
@@ -598,20 +639,28 @@ func gbkToUtf8(s []byte) ([]byte, error) {
 // GetFileContentType 获取文件格式
 // fs.go serveContent()#ctypes 变量获取方法
 // 又见：https://golangcode.com/get-the-content-type-of-file/
-func GetFileContentType(out io.Reader) (string, error) {
-	// Only the first 512 bytes are used to sniff the content type.
-	buffer := make([]byte, 512)
+func GetFileContentType(filePath string) (string, error) {
+	ctype := mime.TypeByExtension(filepath.Ext(filePath))
+	if ctype == "" {
+		const defaultType = "application/octet-stream"
+		// The algorithm uses at most sniffLen bytes to make its decision.
+		const sniffLen = 512
+		// read a chunk to decide between utf-8 text and binary
+		var buf [sniffLen]byte
+		content, eo := os.Open(filePath)
+		if eo != nil {
+			return defaultType, eo
+		}
+		defer content.Close()
 
-	_, err := out.Read(buffer)
-	if err != nil {
-		return "application/octet-stream", err
+		n, er := io.ReadFull(content, buf[:])
+		if er != nil {
+			return defaultType, er
+		}
+		ctype = http.DetectContentType(buf[:n])
 	}
 
-	// Use the net/http package's handy DectectContentType function. Always returns a valid
-	// content-type by returning "application/octet-stream" if no others seemed to match.
-	contentType := http.DetectContentType(buffer)
-
-	return contentType, nil
+	return ctype, nil
 }
 
 func temp() string {
@@ -672,6 +721,7 @@ func main() {
 	v1.POST("/file", output(PostFile))
 	v1.POST("/file/:name", output(PostFile))
 	v1.POST("/files", output(PostFiles))
+	v1.GET("/dl/*url", output(PostURI))
 	v1.GET("/apk/:package/:version", output(GetLatestAPK))
 	v1.POST("/apk", output(PostAPK))
 
