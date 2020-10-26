@@ -21,6 +21,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -57,7 +58,7 @@ const indexHTMLTemplate = `<!DOCTYPE HTML>
 `
 
 const (
-	defaultMaxMemory = 512 << 20 // 512 MB
+	defaultMaxMemory = 16 << 20 //  16 MB
 )
 
 var (
@@ -141,7 +142,7 @@ func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
 
 func checkMultipartForm(c *gin.Context) error {
 	if c.Request.MultipartForm == nil {
-		e := c.Request.ParseMultipartForm(defaultMaxMemory)
+		e := c.Request.ParseMultipartForm(0)
 		return e
 	}
 	return nil
@@ -185,11 +186,11 @@ func PostFile(c *gin.Context) APIMessage {
 				filename = files[0].Filename
 			}
 			open := func() (io.ReadCloser, error) { return files[0].Open() }
-			_, err := saveFile(filename, open)
+			_, id, err := saveFile(filename, open)
 			if err != nil {
 				return getStringAPIMessage(http.StatusInternalServerError, err.Error())
 			}
-			return getStringAPIMessage(http.StatusOK, "Success")
+			return getStringAPIMessage(http.StatusOK, strconv.Itoa(int(id)))
 		}
 	}
 
@@ -204,22 +205,22 @@ func PostFiles(c *gin.Context) APIMessage {
 
 	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
 		status := make(map[string]string)
+		succids := make(map[string]uint)
 		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
 			for _, v := range files {
 				open := func() (io.ReadCloser, error) { return v.Open() }
-				filename, err := saveFile(v.Filename, open)
+				filename, id, err := saveFile(v.Filename, open)
 				if err != nil {
 					status[filename] = err.Error()
+				} else {
+					succids[filename] = id
 				}
 			}
 
 			if 0 < len(status) {
-				for k := range status {
-					os.Remove(filepath.Join(temp(), k))
-				}
 				return getJSONAPIMessage(http.StatusInternalServerError, status)
 			}
-			return getStringAPIMessage(http.StatusOK, "Success")
+			return getJSONAPIMessage(http.StatusOK, succids)
 		}
 	}
 
@@ -256,20 +257,20 @@ func PostURI(c *gin.Context) APIMessage {
 	}
 
 	open := func() (io.ReadCloser, error) { return resp.Body, nil }
-	_, es := saveFile(filename, open)
+	_, id, es := saveFile(filename, open)
 
 	if es != nil {
 		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
 	}
 
-	return getStringAPIMessage(http.StatusOK, "Success")
+	return getStringAPIMessage(http.StatusOK, strconv.Itoa(int(id)))
 }
 
-func saveFile(filename string, open func() (io.ReadCloser, error)) (string, error) {
+func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint, error) {
 	file, eo := open()
 
 	if eo != nil {
-		return filename, eo
+		return filename, 0, eo
 	}
 	defer file.Close()
 
@@ -277,25 +278,27 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, erro
 
 	_, es := os.Stat(tempPath)
 	if es == nil {
-		return filename, errors.New("File already exists")
+		return filename, 0, errors.New("File already exists")
 	}
 
 	temp, eof := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if eof != nil {
-		return filename, eof
+		return filename, 0, eof
 	}
 
 	h := md5.New()
-	buf := make([]byte, 1024)
+	buf := make([]byte, 32*1024) // 32KB buffer
 	var len int64 = 0
 	var err error
+	var nr, nw int
+	var er, ew error
 
 	for {
-		nr, er := file.Read(buf)
+		nr, er = file.Read(buf)
 
 		if nr > 0 {
 			// 计算文件 md5 值
-			nw, ew := h.Write(buf[:nr])
+			nw, ew = h.Write(buf[:nr])
 			if ew != nil {
 				err = ew
 				break
@@ -330,33 +333,34 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, erro
 	}
 
 	if err != nil {
-		return filename, err
+		os.Remove(tempPath)
+		return filename, 0, err
 	}
 
 	md5str := hex.EncodeToString(h.Sum(nil))
 	filedir := filepath.Join(downloadPath, time.Now().Format("20060102"))
 	em := MkdirIfNotExists(filedir)
 	if em != nil {
-		return filename, em
+		os.Remove(tempPath)
+		return filename, 0, em
+	}
+
+	var storage Storage
+	var filePath string
+	ef := sqlite.Where("md5=?", md5str).First(&storage).Error
+	if ef != nil {
+		filePath = filepath.Join(filedir, md5str)
+		er := os.Rename(tempPath, filePath)
+		if er != nil {
+			os.Remove(tempPath)
+			return filename, 0, er
+		}
+	} else {
+		filePath = storage.Path
+		os.Remove(tempPath)
 	}
 
 	contentType, _ := GetFileContentType(tempPath)
-	// 如果存在同名且文件md5相同的情况，则直接返回成功
-	// 如果存在同名但文件md5不相同的情况，则返回重命名错误
-	// 如果存在不同名而文件md5相同的情况，则直接写入一条数据即可
-	hasExist := false
-	filePath := filepath.Join(filedir, md5str)
-	_, es = os.Stat(filePath)
-	if es != nil && os.IsNotExist(es) {
-		er := os.Rename(tempPath, filePath)
-		if er != nil {
-			return filename, er
-		}
-	} else {
-		hasExist = true
-	}
-
-	os.Remove(tempPath)
 
 	save := Storage{
 		Md5:    md5str,
@@ -366,19 +370,11 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, erro
 		Type:   contentType,
 	}
 
-	var count int
-	sqlite.Table("storages").Where("name=?", filename).Count(&count)
-	if 0 < count {
-		if !hasExist {
-			return filename, errors.New("There is already a file with the same name")
-		}
-		return filename, nil
-	}
 	ess := sqlite.Save(&save).Error
 	if ess != nil {
-		return filename, ess
+		return filename, 0, ess
 	}
-	return filename, nil
+	return filename, save.ID, nil
 }
 
 // GetLatestAPK 根据包名和版本号，获取最新的 APK 文件
@@ -725,5 +721,6 @@ func main() {
 	v1.GET("/apk/:package/:version", output(GetLatestAPK))
 	v1.POST("/apk", output(PostAPK))
 
+	pprof.Register(router)
 	router.Run(":19823")
 }
