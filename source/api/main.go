@@ -16,12 +16,13 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
-	"github.com/gin-contrib/pprof"
+	// "github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
 	"golang.org/x/text/encoding/simplifiedchinese"
@@ -122,7 +123,9 @@ func IndexHTML(c *gin.Context) {
 
 func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		tcn := time.Now()
 		msg := fn(c)
+		fmt.Println("total time(s): ", float64(time.Now().UnixNano()-tcn.UnixNano())/1000000000)
 
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -175,26 +178,27 @@ func GetFile(c *gin.Context) APIMessage {
 
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	if e := checkMultipartForm(c); e != nil {
-		return getStringAPIMessage(http.StatusBadRequest, e.Error())
+	cpuprofile, _ := os.Create(filepath.Join(temp(), ".cpuprofile"))
+	pprof.StartCPUProfile(cpuprofile)
+	defer pprof.StopCPUProfile()
+	file, err := c.FormFile("file")
+	if err != nil {
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
 	}
 
-	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
-		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
-			filename := c.Param("name")
-			if filename == "" || filename == "/" {
-				filename = files[0].Filename
-			}
-			open := func() (io.ReadCloser, error) { return files[0].Open() }
-			_, id, err := saveFile(filename, open)
-			if err != nil {
-				return getStringAPIMessage(http.StatusInternalServerError, err.Error())
-			}
-			return getStringAPIMessage(http.StatusOK, strconv.Itoa(int(id)))
-		}
+	filename := c.Param("name")
+	if filename == "" || filename == "/" {
+		filename = file.Filename
 	}
-
-	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
+	open := func() (io.ReadCloser, error) { return file.Open() }
+	_, id, err := saveFile(filename, open)
+	memprofile, _ := os.Create(filepath.Join(temp(), ".memprofile"))
+	pprof.WriteHeapProfile(memprofile)
+	memprofile.Close()
+	if err != nil {
+		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+	}
+	return getJSONAPIMessage(http.StatusOK, id)
 }
 
 // PostFiles 保存多个文件
@@ -263,7 +267,7 @@ func PostURI(c *gin.Context) APIMessage {
 		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
 	}
 
-	return getStringAPIMessage(http.StatusOK, strconv.Itoa(int(id)))
+	return getJSONAPIMessage(http.StatusOK, id)
 }
 
 func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint, error) {
@@ -721,6 +725,5 @@ func main() {
 	v1.GET("/apk/:package/:version", output(GetLatestAPK))
 	v1.POST("/apk", output(PostAPK))
 
-	pprof.Register(router)
 	router.Run(":19823")
 }
