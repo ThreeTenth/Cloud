@@ -16,7 +16,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"text/template"
@@ -60,6 +59,7 @@ const indexHTMLTemplate = `<!DOCTYPE HTML>
 
 const (
 	defaultMaxMemory = 16 << 20 //  16 MB
+	_1M              = 1 << 20  // 1MB
 )
 
 var (
@@ -123,9 +123,20 @@ func IndexHTML(c *gin.Context) {
 
 func output(fn func(*gin.Context) APIMessage) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tcn := time.Now()
+		// ch := make(chan APIMessage, 1)
+		// go func() {
+		// 	ch <- fn(c)
+		// }()
+
+		// var msg APIMessage
+		// select {
+		// case msg = <-ch:
+		// 	fmt.Println(msg)
+		// case <-c.Request.Context().Done():
+		// 	fmt.Println("Client done")
+		// 	return
+		// }
 		msg := fn(c)
-		fmt.Println("total time(s): ", float64(time.Now().UnixNano()-tcn.UnixNano())/1000000000)
 
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -176,11 +187,103 @@ func GetFile(c *gin.Context) APIMessage {
 	return getBinaryAPIMessage(http.StatusOK, storage.Path)
 }
 
+// TestPostFile 保存文件
+func TestPostFile(c *gin.Context) APIMessage {
+	fmt.Println(time.Now(), "parse file", c.Request.ContentLength)
+	multipartReader, err := c.Request.MultipartReader()
+	if err != nil {
+		fmt.Println(time.Now(), "parse file failed")
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
+	}
+	defer c.Request.Body.Close()
+	fmt.Println(time.Now(), "read file")
+	file, err := multipartReader.NextPart()
+	if err == io.EOF {
+		fmt.Println(time.Now(), "read file failed")
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
+	}
+	if "file" != file.FormName() {
+		fmt.Println(time.Now(), "no file")
+		return getStringAPIMessage(http.StatusBadRequest, "no file")
+	}
+	// fmt.Println(time.Now(), file)
+	fmt.Println(time.Now(), "get filename")
+	filename := file.FileName()
+	tempPath := filepath.Join(temp(), filename)
+	h := md5.New()
+	buf := make([]byte, 4096) // 32KB buffer
+	var len int64
+	var nr, nw int
+	var er, ew error
+	temp, eof := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if eof != nil {
+		fmt.Println(time.Now(), "no file")
+		return getStringAPIMessage(http.StatusBadRequest, eof.Error())
+	}
+	fmt.Println(time.Now(), "create file")
+	prevTime := time.Now().Unix()
+	var countTime int64
+	for {
+		nr, er = file.Read(buf)
+
+		if nr > 0 {
+			// 计算文件 md5 值
+			nw, ew = h.Write(buf[:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+			// 储存临时文件
+			nw, ew = temp.Write(buf[:nr])
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+			len += int64(nw)
+			t := time.Now().Unix() - prevTime
+			countTime += t
+			if 1 <= t {
+				prevTime = time.Now().Unix()
+				speed := float64(len) / float64(countTime) / _1M
+				fmt.Println(time.Now(), "download ", len, countTime, speed)
+			}
+			if er != nil {
+				if er != io.EOF {
+					err = er
+				}
+				break
+			}
+		}
+
+		select {
+		case <-c.Request.Context().Done():
+			fmt.Println("Client done")
+			temp.Close()
+			return getStringAPIMessage(http.StatusBadRequest, "Client closed")
+		default:
+			continue
+		}
+	}
+
+	if err1 := temp.Close(); err == nil {
+		err = err1
+	}
+
+	speed := float64(len) / float64(countTime) / _1M
+	fmt.Println(time.Now(), "finish ", len, countTime, speed)
+	return getJSONAPIMessage(http.StatusOK, 0)
+}
+
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	cpuprofile, _ := os.Create(filepath.Join(temp(), ".cpuprofile"))
-	pprof.StartCPUProfile(cpuprofile)
-	defer pprof.StopCPUProfile()
 	file, err := c.FormFile("file")
 	if err != nil {
 		return getStringAPIMessage(http.StatusBadRequest, err.Error())
@@ -192,9 +295,6 @@ func PostFile(c *gin.Context) APIMessage {
 	}
 	open := func() (io.ReadCloser, error) { return file.Open() }
 	_, id, err := saveFile(filename, open)
-	memprofile, _ := os.Create(filepath.Join(temp(), ".memprofile"))
-	pprof.WriteHeapProfile(memprofile)
-	memprofile.Close()
 	if err != nil {
 		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
 	}
@@ -273,6 +373,8 @@ func PostURI(c *gin.Context) APIMessage {
 func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint, error) {
 	file, eo := open()
 
+	fmt.Println(time.Now(), "open file")
+
 	if eo != nil {
 		return filename, 0, eo
 	}
@@ -289,6 +391,7 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 	if eof != nil {
 		return filename, 0, eof
 	}
+	fmt.Println(time.Now(), "create temp")
 
 	h := md5.New()
 	buf := make([]byte, 32*1024) // 32KB buffer
@@ -324,6 +427,7 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 			}
 			len += int64(nw)
 		}
+		fmt.Println(time.Now(), "download ", len, nr)
 		if er != nil {
 			if er != io.EOF {
 				err = er
@@ -332,12 +436,15 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 		}
 	}
 
+	fmt.Println(time.Now(), "finish ", len, nr)
+
 	if err1 := temp.Close(); err == nil {
 		err = err1
 	}
 
 	if err != nil {
 		os.Remove(tempPath)
+		fmt.Println(err.Error())
 		return filename, 0, err
 	}
 
@@ -346,6 +453,7 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 	em := MkdirIfNotExists(filedir)
 	if em != nil {
 		os.Remove(tempPath)
+		fmt.Println(em.Error())
 		return filename, 0, em
 	}
 
