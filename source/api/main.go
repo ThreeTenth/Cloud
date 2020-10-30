@@ -27,6 +27,8 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 
+	"cloud.saynice.xyz/utils"
+
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
 )
 
@@ -284,21 +286,106 @@ func TestPostFile(c *gin.Context) APIMessage {
 
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	file, err := c.FormFile("file")
-	if err != nil {
-		return getStringAPIMessage(http.StatusBadRequest, err.Error())
+	var tempfile *os.File
+	var err error
+
+	open := func(name string, filename string) (string, error) {
+		path := filepath.Join(temp(), filename)
+		tempfile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+		return path, err
 	}
 
-	filename := c.Param("name")
-	if filename == "" || filename == "/" {
-		filename = file.Filename
+	h := md5.New()
+	var len int64
+	var nw int
+	var ew error
+
+	write := func(buf []byte, nr int, er error) error {
+		if nr > 0 {
+			// 计算文件 md5 值
+			nw, ew = h.Write(buf[:nr])
+			if ew != nil {
+				return ew
+			}
+			if nr != nw {
+				return io.ErrShortWrite
+			}
+
+			// 储存临时文件
+			nw, ew = tempfile.Write(buf[:nr])
+			if ew != nil {
+				return ew
+			}
+			if nr != nw {
+				return io.ErrShortWrite
+			}
+
+			len += int64(nw)
+		}
+		return er
 	}
-	open := func() (io.ReadCloser, error) { return file.Open() }
-	_, id, err := saveFile(filename, open)
+
+	close := func(name string, filename string, path string) error {
+		if err1 := tempfile.Close(); err == nil {
+			err = err1
+		}
+
+		if err != nil {
+			os.Remove(path)
+			return err
+		}
+
+		md5str := hex.EncodeToString(h.Sum(nil))
+		filedir := filepath.Join(downloadPath, time.Now().Format("20060102"))
+		em := MkdirIfNotExists(filedir)
+		if em != nil {
+			os.Remove(path)
+			fmt.Println(em.Error())
+			return em
+		}
+
+		var storage Storage
+		var filePath string
+		ef := sqlite.Where("md5=?", md5str).First(&storage).Error
+		if ef != nil {
+			filePath = filepath.Join(filedir, md5str)
+			er := os.Rename(path, filePath)
+			if er != nil {
+				os.Remove(path)
+				return er
+			}
+		} else {
+			filePath = storage.Path
+			os.Remove(path)
+		}
+
+		contentType, _ := GetFileContentType(filePath)
+
+		save := Storage{
+			Md5:    md5str,
+			Path:   filePath,
+			Name:   filename,
+			Length: len,
+			Type:   contentType,
+		}
+
+		ess := sqlite.Save(&save).Error
+		if ess != nil {
+		}
+		return ess
+	}
+
+	_, files, err := utils.ReadMultipartForm(c.Request, open, write, close)
+
 	if err != nil {
 		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
 	}
-	return getJSONAPIMessage(http.StatusOK, id)
+
+	if "" == files.Get("file") {
+		return getStringAPIMessage(http.StatusBadRequest, "no file")
+	}
+
+	return getJSONAPIMessage(http.StatusOK, 0)
 }
 
 // PostFiles 保存多个文件
