@@ -286,12 +286,16 @@ func TestPostFile(c *gin.Context) APIMessage {
 
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
+	fname, ok := c.Params.Get("name")
 	var tempfile *os.File
 	var err error
 
 	open := func(name string, filename string) (string, error) {
 		if "file" != name {
 			return "", errors.New("no file")
+		}
+		if ok {
+			filename = fname
 		}
 		path := filepath.Join(temp(), filename)
 		tempfile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
