@@ -116,41 +116,49 @@ func New64HexUUID() (string, error) {
 	// version 4 (pseudo-random); see section 4.1.3
 	uuid[6] = uuid[6]&^0xf0 | 0x40
 
-	s0, _ := hexValueOf(uuid[0:6], digits)
-	s1, _ := hexValueOf(uuid[6:12], digits)
-	s2, _ := hexValueOf(uuid[12:], digits)
-	return s0 + s1 + s2, nil
+	return uuidValueOf(uuid), nil
 }
 
-func hexValueOf(b []byte, digits string) (string, error) {
-	hex := 1
-	carry := 0
-	for {
-		if hex == len(digits) {
-			break
-		} else if 8 < carry {
-			return "", errors.New("hex is too big")
-		}
-		hex *= 2
-		carry++
-	}
-	u := uint64(b[len(b)-1])
-	ucarry := 8
-	for i := len(b) - 2; 0 <= i; i-- {
-		u |= uint64(b[i]) << ucarry
-		ucarry += 8
-	}
-	and := uint64(hex - 1)
-	var s [68]byte
-	sindex := len(s)
-	for {
-		if u <= 0 {
-			break
-		}
+func uuidValueOf(b []byte) string {
+	carry := 6
+	size := 3
 
-		sindex--
-		s[sindex] = digits[u&and]
-		u >>= carry
+	var temp []byte
+	var s [68]byte
+	sindex := 0
+	var start, end int
+
+	for {
+		if start == len(b) {
+			break
+		}
+		end = start + size
+		if len(b) < end {
+			end = len(b)
+		}
+		temp = b[start:end]
+		start = end
+		u := uint64(temp[len(temp)-1])
+		ucarry := 8
+		for i := len(temp) - 2; 0 <= i; i-- {
+			u |= uint64(temp[i]) << ucarry
+			ucarry += 8
+		}
+		i := 4
+		for {
+			if u <= 0 {
+				break
+			}
+
+			i--
+			s[sindex+i] = digits[u&63]
+			u >>= carry
+		}
+		for 0 < i {
+			i--
+			s[sindex+i] = digits[0]
+		}
+		sindex += 4
 	}
-	return string(s[sindex:]), nil
+	return string(s[0:sindex])
 }
