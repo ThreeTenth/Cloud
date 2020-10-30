@@ -294,8 +294,8 @@ func PostFile(c *gin.Context) APIMessage {
 		if "file" != name {
 			return "", errors.New("no file")
 		}
-		if ok {
-			filename = fname
+		if !ok {
+			fname = filename
 		}
 		path := filepath.Join(temp(), filename)
 		tempfile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
@@ -373,7 +373,7 @@ func PostFile(c *gin.Context) APIMessage {
 		save := Storage{
 			Md5:    md5str,
 			Path:   filePath,
-			Name:   filename,
+			Name:   fname,
 			Length: len,
 			Type:   contentType,
 		}
