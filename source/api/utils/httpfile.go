@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"io"
 	"net/http"
@@ -100,4 +101,56 @@ func IsDone(r *http.Request) bool {
 	default:
 		return false
 	}
+}
+
+// New64HexUUID 获取 64进制 UUID, 10个数字+26个小写字母+26个大写字母+(=、_), 长度 24
+// generates a random UUID according to RFC 4122
+func New64HexUUID() (string, error) {
+	uuid := make([]byte, 18)
+	n, err := io.ReadFull(rand.Reader, uuid)
+	if n != len(uuid) || err != nil {
+		return "", err
+	}
+	// variant bits; see section 4.1.1
+	uuid[8] = uuid[8]&^0xc0 | 0x80
+	// version 4 (pseudo-random); see section 4.1.3
+	uuid[6] = uuid[6]&^0xf0 | 0x40
+
+	s0, _ := hexValueOf(uuid[0:6], digits)
+	s1, _ := hexValueOf(uuid[6:12], digits)
+	s2, _ := hexValueOf(uuid[12:], digits)
+	return s0 + s1 + s2, nil
+}
+
+func hexValueOf(b []byte, digits string) (string, error) {
+	hex := 1
+	carry := 0
+	for {
+		if hex == len(digits) {
+			break
+		} else if 8 < carry {
+			return "", errors.New("hex is too big")
+		}
+		hex *= 2
+		carry++
+	}
+	u := uint64(b[len(b)-1])
+	ucarry := 8
+	for i := len(b) - 2; 0 <= i; i-- {
+		u |= uint64(b[i]) << ucarry
+		ucarry += 8
+	}
+	and := uint64(hex - 1)
+	var s [68]byte
+	sindex := len(s)
+	for {
+		if u <= 0 {
+			break
+		}
+
+		sindex--
+		s[sindex] = digits[u&and]
+		u >>= carry
+	}
+	return string(s[sindex:]), nil
 }

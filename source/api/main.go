@@ -385,7 +385,8 @@ func PostFile(c *gin.Context) APIMessage {
 		return getStringAPIMessage(http.StatusBadRequest, "no file")
 	}
 
-	return getJSONAPIMessage(http.StatusOK, 0)
+	uuid, _ := utils.New64HexUUID()
+	return getStringAPIMessage(http.StatusOK, uuid)
 }
 
 // PostFiles 保存多个文件
