@@ -326,6 +326,8 @@ func PostFile(c *gin.Context) APIMessage {
 	}
 
 	close := func(name string, filename string, path string) error {
+		// 不要在可写文件上使用 defer Close() 方法
+		// @see https://www.joeshaw.org/dont-defer-close-on-writable-files/
 		if err1 := tempfile.Close(); err == nil {
 			err = err1
 		}
