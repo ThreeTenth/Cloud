@@ -1,4 +1,4 @@
-module cloud.saynice.xyz/v1
+module cloud.saynice.xyz
 
 go 1.14
 
