@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -189,112 +190,84 @@ func GetFile(c *gin.Context) APIMessage {
 	return getBinaryAPIMessage(http.StatusOK, storage.Path)
 }
 
-// TestPostFile 保存文件
-func TestPostFile(c *gin.Context) APIMessage {
-	fmt.Println(time.Now(), "parse file", c.Request.ContentLength)
-	multipartReader, err := c.Request.MultipartReader()
-	if err != nil {
-		fmt.Println(time.Now(), "parse file failed")
-		return getStringAPIMessage(http.StatusBadRequest, err.Error())
-	}
-	defer c.Request.Body.Close()
-	fmt.Println(time.Now(), "read file")
-	file, err := multipartReader.NextPart()
-	if err == io.EOF {
-		fmt.Println(time.Now(), "read file failed")
-		return getStringAPIMessage(http.StatusBadRequest, err.Error())
-	}
-	if "file" != file.FormName() {
-		fmt.Println(time.Now(), "no file")
-		return getStringAPIMessage(http.StatusBadRequest, "no file")
-	}
-	// fmt.Println(time.Now(), file)
-	fmt.Println(time.Now(), "get filename")
-	filename := file.FileName()
-	tempPath := filepath.Join(temp(), filename)
-	h := md5.New()
-	buf := make([]byte, 4096) // 32KB buffer
-	var len int64
-	var nr, nw int
-	var er, ew error
-	temp, eof := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-	if eof != nil {
-		fmt.Println(time.Now(), "no file")
-		return getStringAPIMessage(http.StatusBadRequest, eof.Error())
-	}
-	fmt.Println(time.Now(), "create file")
-	prevTime := time.Now().Unix()
-	var countTime int64
-	for {
-		nr, er = file.Read(buf)
-
-		if nr > 0 {
-			// 计算文件 md5 值
-			nw, ew = h.Write(buf[:nr])
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-			// 储存临时文件
-			nw, ew = temp.Write(buf[:nr])
-			if ew != nil {
-				err = ew
-				break
-			}
-			if nr != nw {
-				err = io.ErrShortWrite
-				break
-			}
-			len += int64(nw)
-			t := time.Now().Unix() - prevTime
-			countTime += t
-			if 1 <= t {
-				prevTime = time.Now().Unix()
-				speed := float64(len) / float64(countTime) / _1M
-				fmt.Println(time.Now(), "download ", len, countTime, speed)
-			}
-			if er != nil {
-				if er != io.EOF {
-					err = er
-				}
-				break
-			}
-		}
-
-		select {
-		case <-c.Request.Context().Done():
-			fmt.Println("Client done")
-			temp.Close()
-			return getStringAPIMessage(http.StatusBadRequest, "Client closed")
-		default:
-			continue
-		}
-	}
-
-	if err1 := temp.Close(); err == nil {
-		err = err1
-	}
-
-	speed := float64(len) / float64(countTime) / _1M
-	fmt.Println(time.Now(), "finish ", len, countTime, speed)
-	return getJSONAPIMessage(http.StatusOK, 0)
-}
-
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	fname, ok := c.Params.Get("name")
+	fname, _ := c.Params.Get("name")
+
+	_, _, err := SaveMultipartFile(c.Request, fname)
+
+	if err != nil {
+		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+	}
+
+	return getStringAPIMessage(http.StatusOK, "success")
+}
+
+// PostFiles 保存多个文件
+func PostFiles(c *gin.Context) APIMessage {
+	_, _, err := SaveMultipartFile(c.Request)
+
+	if err != nil {
+		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+	}
+
+	return getStringAPIMessage(http.StatusOK, "success")
+}
+
+// PostURI 提交一个 URI，进行离线下载
+func PostURI(c *gin.Context) APIMessage {
+	dl, ok := c.Params.Get("url")
+	if !ok && len(dl) <= 1 {
+		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
+	}
+
+	req, err := http.NewRequest("GET", dl[1:], nil)
+	if err != nil {
+		return getStringAPIMessage(http.StatusNotFound, "This uri can't find")
+	}
+
+	resp, ed := http.DefaultClient.Do(req)
+
+	if ed != nil {
+		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
+	}
+
+	defer resp.Body.Close()
+
+	disp := resp.Header.Get("Content-Disposition")
+	var filename string
+	_, params, ep := mime.ParseMediaType(disp)
+	if ep != nil {
+		filename = path.Base(req.URL.Path)
+	} else {
+		filename = params["filename"]
+	}
+
+	open := func() (io.ReadCloser, error) { return resp.Body, nil }
+	_, id, es := saveFile(filename, open)
+
+	if es != nil {
+		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
+	}
+
+	return getJSONAPIMessage(http.StatusOK, id)
+}
+
+// SaveMultipartFile 保存多文件
+func SaveMultipartFile(request *http.Request, rename ...string) (url.Values, url.Values, error) {
 	var tempfile *os.File
 	var err error
+	var fname string
+
+	if 1 == len(rename) {
+		fname = rename[0]
+	}
 
 	open := func(name string, filename string) (string, error) {
 		if "file" != name {
-			return "", errors.New("no file")
+			return "", errors.New("Params error: not support " + name)
 		}
-		if !ok {
+		if fname == "" {
 			fname = filename
 		}
 		path := filepath.Join(temp(), filename)
@@ -384,87 +357,7 @@ func PostFile(c *gin.Context) APIMessage {
 		return ess
 	}
 
-	_, files, err := utils.ReadMultipartForm(c.Request, open, write, close)
-
-	if err != nil {
-		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
-	}
-
-	if "" == files.Get("file") {
-		return getStringAPIMessage(http.StatusBadRequest, "no file")
-	}
-
-	uuid, _ := utils.New64HexUUID()
-	return getStringAPIMessage(http.StatusOK, uuid)
-}
-
-// PostFiles 保存多个文件
-func PostFiles(c *gin.Context) APIMessage {
-	if e := checkMultipartForm(c); e != nil {
-		return getStringAPIMessage(http.StatusBadRequest, e.Error())
-	}
-
-	if c.Request.MultipartForm != nil && c.Request.MultipartForm.File != nil {
-		status := make(map[string]string)
-		succids := make(map[string]uint)
-		if files := c.Request.MultipartForm.File["file"]; len(files) > 0 {
-			for _, v := range files {
-				open := func() (io.ReadCloser, error) { return v.Open() }
-				filename, id, err := saveFile(v.Filename, open)
-				if err != nil {
-					status[filename] = err.Error()
-				} else {
-					succids[filename] = id
-				}
-			}
-
-			if 0 < len(status) {
-				return getJSONAPIMessage(http.StatusInternalServerError, status)
-			}
-			return getJSONAPIMessage(http.StatusOK, succids)
-		}
-	}
-
-	return getStringAPIMessage(http.StatusBadRequest, "http: no such file")
-}
-
-// PostURI 提交一个 URI，进行离线下载
-func PostURI(c *gin.Context) APIMessage {
-	dl, ok := c.Params.Get("url")
-	if !ok && len(dl) <= 1 {
-		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
-	}
-
-	req, err := http.NewRequest("GET", dl[1:], nil)
-	if err != nil {
-		return getStringAPIMessage(http.StatusNotFound, "This uri can't find")
-	}
-
-	resp, ed := http.DefaultClient.Do(req)
-
-	if ed != nil {
-		return getStringAPIMessage(http.StatusBadRequest, "This uri is invalid")
-	}
-
-	defer resp.Body.Close()
-
-	disp := resp.Header.Get("Content-Disposition")
-	var filename string
-	_, params, ep := mime.ParseMediaType(disp)
-	if ep != nil {
-		filename = path.Base(req.URL.Path)
-	} else {
-		filename = params["filename"]
-	}
-
-	open := func() (io.ReadCloser, error) { return resp.Body, nil }
-	_, id, es := saveFile(filename, open)
-
-	if es != nil {
-		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
-	}
-
-	return getJSONAPIMessage(http.StatusOK, id)
+	return utils.ReadMultipartForm(request, open, write, close)
 }
 
 func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint, error) {

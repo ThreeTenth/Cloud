@@ -93,6 +93,27 @@ func ReadMultipartForm(request *http.Request, open func(string, string) (string,
 	return value, file, err
 }
 
+// ReadRequestBuffer 读取 http 文件
+func ReadRequestBuffer(request *http.Request, p io.Reader, open func(string, string) (string, error), write func([]byte, int, error) error, close func(string, string, string) error) {
+	buf := make([]byte, 4096) // 4KB, golang http 最大读取长度
+	var nr int
+	var er error
+
+	for {
+		nr, er = p.Read(buf)
+		if nr == 0 && io.EOF == er {
+			break
+		}
+		if err := write(buf, nr, er); err != nil {
+			break
+		}
+
+		if IsDone(request) {
+			return
+		}
+	}
+}
+
 // IsDone http request is done
 func IsDone(r *http.Request) bool {
 	select {
