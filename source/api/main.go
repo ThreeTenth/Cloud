@@ -263,6 +263,8 @@ func SaveMultipartFile(request *http.Request, rename ...string) (url.Values, url
 		fname = rename[0]
 	}
 
+	prevTime := time.Now().Unix()
+
 	open := func(name string, filename string) (string, error) {
 		if "file" != name {
 			return "", errors.New("Params error: not support " + name)
@@ -354,6 +356,7 @@ func SaveMultipartFile(request *http.Request, rename ...string) (url.Values, url
 		ess := sqlite.Save(&save).Error
 		if ess != nil {
 		}
+		fmt.Println(">>>", fname, ":", float64(len)/1048576.0, float64(len)/float64(time.Now().Unix()-prevTime)/1048576.0)
 		return ess
 	}
 
@@ -417,7 +420,7 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 			}
 			len += int64(nw)
 		}
-		fmt.Println(time.Now(), "download ", len, nr)
+		// fmt.Println(time.Now(), "download ", len, nr)
 		if er != nil {
 			if er != io.EOF {
 				err = er
@@ -812,9 +815,10 @@ func main() {
 	defer sqlite.Close()
 
 	router := gin.Default()
+	router.GET("/", IndexHTML)
+
 	v1 := router.Group("/v1")
 
-	v1.GET("/", IndexHTML)
 	v1.GET("/file/:name", output(GetFile))
 	v1.POST("/file", output(PostFile))
 	v1.POST("/file/:name", output(PostFile))
