@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -25,8 +24,6 @@ import (
 	// "github.com/gin-contrib/pprof"
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/transform"
 
 	"cloud.saynice.xyz/utils"
 
@@ -66,8 +63,8 @@ const (
 )
 
 var (
-	sqlite       *gorm.DB
-	downloadPath string
+	sqlite *gorm.DB
+	root   string
 )
 
 // APIMessage API 消息体
@@ -192,26 +189,91 @@ func GetFile(c *gin.Context) APIMessage {
 
 // PostFile 保存文件
 func PostFile(c *gin.Context) APIMessage {
-	fname, _ := c.Params.Get("name")
+	filename, _ := c.Params.Get("name")
 
-	_, _, err := SaveMultipartFile(c.Request, fname)
+	trailer := c.GetHeader("Trailer")
+
+	if "" != trailer {
+		storage := Storage{}
+		if sqlite.Where("md5=?", trailer).Find(&storage).Error == nil {
+			return getJSONAPIMessage(http.StatusOK, storage.ID)
+		}
+	}
+
+	r, err := c.Request.MultipartReader()
+	if err != nil {
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
+	}
+
+	part, err := r.NextPart()
+	if err != nil {
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
+	}
+	defer part.Close()
+
+	name := part.FormName()
+	if name != "file" {
+		return getStringAPIMessage(http.StatusBadRequest, "Bad request: no file")
+	}
+
+	if "" == filename {
+		filename = part.FileName()
+	}
+
+	id, err := readAndSaveFile(filename, part, c.Request)
 
 	if err != nil {
 		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
 	}
 
-	return getStringAPIMessage(http.StatusOK, "success")
+	return getJSONAPIMessage(http.StatusOK, id)
 }
 
 // PostFiles 保存多个文件
 func PostFiles(c *gin.Context) APIMessage {
-	_, _, err := SaveMultipartFile(c.Request)
-
+	r, err := c.Request.MultipartReader()
 	if err != nil {
-		return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+		return getStringAPIMessage(http.StatusBadRequest, err.Error())
 	}
 
-	return getStringAPIMessage(http.StatusOK, "success")
+	ids := make(map[string]uint)
+	for {
+		part, err := r.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+		}
+
+		name := part.FormName()
+		if name != "file" {
+			return getStringAPIMessage(http.StatusBadRequest, "Bad request: no file")
+		}
+
+		filename := part.FileName()
+		if filename == "" {
+			return getStringAPIMessage(http.StatusBadRequest, "Bad request: no file name")
+		}
+
+		id, err := readAndSaveFile(filename, part, c.Request)
+
+		if err1 := part.Close(); err == nil {
+			err = err1
+		}
+
+		if err != nil {
+			return getStringAPIMessage(http.StatusInternalServerError, err.Error())
+		}
+
+		ids[filename] = id
+
+		if utils.IsDone(c.Request) {
+			return getStringAPIMessage(http.StatusInternalServerError, "Client done")
+		}
+	}
+
+	return getJSONAPIMessage(http.StatusOK, ids)
 }
 
 // PostURI 提交一个 URI，进行离线下载
@@ -243,8 +305,8 @@ func PostURI(c *gin.Context) APIMessage {
 		filename = params["filename"]
 	}
 
-	open := func() (io.ReadCloser, error) { return resp.Body, nil }
-	_, id, es := saveFile(filename, open)
+	// open := func() (io.ReadCloser, error) { return resp.Body, nil }
+	id, es := readAndSaveFile(filename, resp.Body, req)
 
 	if es != nil {
 		return getStringAPIMessage(http.StatusInternalServerError, es.Error())
@@ -253,136 +315,17 @@ func PostURI(c *gin.Context) APIMessage {
 	return getJSONAPIMessage(http.StatusOK, id)
 }
 
-// SaveMultipartFile 保存多文件
-func SaveMultipartFile(request *http.Request, rename ...string) (url.Values, url.Values, error) {
-	var tempfile *os.File
-	var err error
-	var fname string
-
-	if 1 == len(rename) {
-		fname = rename[0]
-	}
-
-	prevTime := time.Now().Unix()
-
-	open := func(name string, filename string) (string, error) {
-		if "file" != name {
-			return "", errors.New("Params error: not support " + name)
-		}
-		if fname == "" {
-			fname = filename
-		}
-		path := filepath.Join(temp(), filename)
-		tempfile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
-		return path, err
-	}
-
-	h := md5.New()
-	var len int64
-	var nw int
-	var ew error
-
-	write := func(buf []byte, nr int, er error) error {
-		if nr > 0 {
-			// 计算文件 md5 值
-			nw, ew = h.Write(buf[:nr])
-			if ew != nil {
-				return ew
-			}
-			if nr != nw {
-				return io.ErrShortWrite
-			}
-
-			// 储存临时文件
-			nw, ew = tempfile.Write(buf[:nr])
-			if ew != nil {
-				return ew
-			}
-			if nr != nw {
-				return io.ErrShortWrite
-			}
-
-			len += int64(nw)
-		}
-		return er
-	}
-
-	close := func(name string, filename string, path string) error {
-		// 不要在可写文件上使用 defer Close() 方法
-		// @see https://www.joeshaw.org/dont-defer-close-on-writable-files/
-		if err1 := tempfile.Close(); err == nil {
-			err = err1
-		}
-
-		if err != nil {
-			os.Remove(path)
-			return err
-		}
-
-		md5str := hex.EncodeToString(h.Sum(nil))
-		filedir := filepath.Join(downloadPath, time.Now().Format("20060102"))
-		em := MkdirIfNotExists(filedir)
-		if em != nil {
-			os.Remove(path)
-			fmt.Println(em.Error())
-			return em
-		}
-
-		var storage Storage
-		var filePath string
-		ef := sqlite.Where("md5=?", md5str).First(&storage).Error
-		if ef != nil {
-			filePath = filepath.Join(filedir, md5str)
-			er := os.Rename(path, filePath)
-			if er != nil {
-				os.Remove(path)
-				return er
-			}
-		} else {
-			filePath = storage.Path
-			os.Remove(path)
-		}
-
-		contentType, _ := GetFileContentType(filePath)
-
-		save := Storage{
-			Md5:    md5str,
-			Path:   filePath,
-			Name:   fname,
-			Length: len,
-			Type:   contentType,
-		}
-
-		ess := sqlite.Save(&save).Error
-		if ess != nil {
-		}
-		fmt.Println(">>>", fname, ":", float64(len)/1048576.0, float64(len)/float64(time.Now().Unix()-prevTime)/1048576.0)
-		return ess
-	}
-
-	return utils.ReadMultipartForm(request, open, write, close)
-}
-
-func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint, error) {
-	file, eo := open()
-
-	fmt.Println(time.Now(), "open file")
-
-	if eo != nil {
-		return filename, 0, eo
-	}
-	defer file.Close()
-
+func readAndSaveFile(filename string, file io.Reader, request *http.Request) (uint, error) {
 	tempPath := filepath.Join(temp(), filename)
 
 	_, es := os.Stat(tempPath)
 	if es == nil {
-		return filename, 0, errors.New("File already exists")
+		return 0, errors.New("File already exists")
 	}
 
 	temp, eof := os.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if eof != nil {
-		return filename, 0, eof
+		return 0, eof
 	}
 	fmt.Println(time.Now(), "create temp")
 
@@ -395,6 +338,10 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 
 	for {
 		nr, er = file.Read(buf)
+
+		if nr == 0 && io.EOF == er {
+			break
+		}
 
 		if nr > 0 {
 			// 计算文件 md5 值
@@ -420,12 +367,14 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 			}
 			len += int64(nw)
 		}
-		// fmt.Println(time.Now(), "download ", len, nr)
 		if er != nil {
 			if er != io.EOF {
 				err = er
 			}
 			break
+		}
+		if utils.IsDone(request) {
+			return 0, errors.New("client done")
 		}
 	}
 
@@ -438,16 +387,16 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 	if err != nil {
 		os.Remove(tempPath)
 		fmt.Println(err.Error())
-		return filename, 0, err
+		return 0, err
 	}
 
 	md5str := hex.EncodeToString(h.Sum(nil))
-	filedir := filepath.Join(downloadPath, time.Now().Format("20060102"))
+	filedir := filepath.Join(root, time.Now().Format("20060102"))
 	em := MkdirIfNotExists(filedir)
 	if em != nil {
 		os.Remove(tempPath)
 		fmt.Println(em.Error())
-		return filename, 0, em
+		return 0, em
 	}
 
 	var storage Storage
@@ -458,7 +407,7 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 		er := os.Rename(tempPath, filePath)
 		if er != nil {
 			os.Remove(tempPath)
-			return filename, 0, er
+			return 0, er
 		}
 	} else {
 		filePath = storage.Path
@@ -477,9 +426,9 @@ func saveFile(filename string, open func() (io.ReadCloser, error)) (string, uint
 
 	ess := sqlite.Save(&save).Error
 	if ess != nil {
-		return filename, 0, ess
+		return 0, ess
 	}
-	return filename, save.ID, nil
+	return save.ID, nil
 }
 
 // GetLatestAPK 根据包名和版本号，获取最新的 APK 文件
@@ -620,7 +569,7 @@ func SaveAPK(filename string, content []byte) error {
 			return errors.New("Error: An application with the same package name and version number already exists")
 		}
 
-		saveFilePath := filepath.Join(downloadPath, filename)
+		saveFilePath := filepath.Join(root, filename)
 		e := os.Rename(tempFilePath, saveFilePath)
 
 		if e != nil {
@@ -658,85 +607,6 @@ func cmd(name string, arg ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func preNUm(data byte) int {
-	var mask byte = 0x80
-	var num int = 0
-	//8bit中首个0bit前有多少个1bits
-	for i := 0; i < 8; i++ {
-		if (data & mask) == mask {
-			num++
-			mask = mask >> 1
-		} else {
-			break
-		}
-	}
-	return num
-}
-
-func isUtf8(data []byte) bool {
-	i := 0
-	for i < len(data) {
-		if (data[i] & 0x80) == 0x00 {
-			// 0XXX_XXXX
-			i++
-			continue
-		} else if num := preNUm(data[i]); num > 2 {
-			// 110X_XXXX 10XX_XXXX
-			// 1110_XXXX 10XX_XXXX 10XX_XXXX
-			// 1111_0XXX 10XX_XXXX 10XX_XXXX 10XX_XXXX
-			// 1111_10XX 10XX_XXXX 10XX_XXXX 10XX_XXXX 10XX_XXXX
-			// 1111_110X 10XX_XXXX 10XX_XXXX 10XX_XXXX 10XX_XXXX 10XX_XXXX
-			// preNUm() 返回首个字节的8个bits中首个0bit前面1bit的个数，该数量也是该字符所使用的字节数
-			i++
-			for j := 0; j < num-1; j++ {
-				//判断后面的 num - 1 个字节是不是都是10开头
-				if (data[i] & 0xc0) != 0x80 {
-					return false
-				}
-				i++
-			}
-		} else {
-			//其他情况说明不是utf-8
-			return false
-		}
-	}
-	return true
-}
-
-func isGBK(data []byte) bool {
-	length := len(data)
-	var i int = 0
-	for i < length {
-		if data[i] <= 0x7f {
-			//编码0~127,只有一个字节的编码，兼容ASCII码
-			i++
-			continue
-		} else {
-			//大于127的使用双字节编码，落在gbk编码范围内的字符
-			if data[i] >= 0x81 &&
-				data[i] <= 0xfe &&
-				data[i+1] >= 0x40 &&
-				data[i+1] <= 0xfe &&
-				data[i+1] != 0xf7 {
-				i += 2
-				continue
-			} else {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func gbkToUtf8(s []byte) ([]byte, error) {
-	reader := transform.NewReader(bytes.NewReader(s), simplifiedchinese.GBK.NewDecoder())
-	d, err := ioutil.ReadAll(reader)
-	if err != nil {
-		return nil, err
-	}
-	return d, nil
-}
-
 // GetFileContentType 获取文件格式
 // fs.go serveContent()#ctypes 变量获取方法
 // 又见：https://golangcode.com/get-the-content-type-of-file/
@@ -765,7 +635,7 @@ func GetFileContentType(filePath string) (string, error) {
 }
 
 func temp() string {
-	return filepath.Join(downloadPath, ".temp")
+	return filepath.Join(root, ".temp")
 }
 
 // MkdirIfNotExists 如果目录不存在则创建
@@ -780,7 +650,7 @@ func MkdirIfNotExists(path string) error {
 }
 
 func initFlag() {
-	flag.StringVar(&downloadPath, "D", "./cloud", "文件存储路径")
+	flag.StringVar(&root, "D", "./cloud", "文件存储路径")
 	flag.Parse()
 	flag.Usage()
 }
@@ -794,7 +664,7 @@ func initStorage() {
 
 func initDB() {
 	var err error
-	sqlite, err = gorm.Open("sqlite3", filepath.Join(downloadPath, "cloud.db"))
+	sqlite, err = gorm.Open("sqlite3", filepath.Join(root, "cloud.db"))
 	if err != nil {
 		panic("failed to connect database: " + err.Error())
 	}
